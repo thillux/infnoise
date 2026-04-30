@@ -18,6 +18,7 @@
 #include <linux/completion.h>
 #include <linux/workqueue.h>
 #include <linux/kref.h>
+#include <crypto/hash.h>
 
 /* USB device IDs - Infinite Noise TRNG (pid.codes registered) */
 #define INFNOISE_VENDOR_ID	0x1209	/* pid.codes VID */
@@ -83,47 +84,142 @@
 /* For 512 bytes of data, we need ceil(512/62) = 9 packets = 576 bytes */
 #define INFNOISE_USB_READ_SIZE	(((INFNOISE_BUFLEN + FTDI_DATA_PER_PACKET - 1) / FTDI_DATA_PER_PACKET) * FTDI_PACKET_SIZE)
 
-/* Health check constants */
-#define INM_PREDICTION_BITS	14	/* Bits used for prediction */
-#define INM_TABLE_SIZE		(1 << INM_PREDICTION_BITS)	/* 16384 entries */
-#define INM_MIN_DATA		80000	/* Minimum bits before data is valid */
-#define INM_MIN_SAMPLE_SIZE	100	/* Minimum samples */
 /*
- * Max consecutive same-valued bits before declaring a stuck-at fault.
- * Sized per NIST SP 800-90B repetition-count test: C >= 1 + ceil(-log2(α)/H),
- * with α = 2^-30 (false-positive rate) and H = 0.88 bits/bit ⇒ C ≈ 36.
- * 40 leaves margin for the empirical entropy varying slightly below target.
+ * NIST SP 800-90B health tests (Section 4.4)
+ *
+ * Both tests run continuously on the bit stream extracted from the noise
+ * source (before conditioning). Two thresholds per test:
+ *
+ *   Transient  (α = 2^-30) — latches INFNOISE_HEALTH_FAIL; the current
+ *                            batch is dropped and the recovery path
+ *                            re-arms the tests.
+ *
+ *   Permanent  (α = 2^-60) — latches INFNOISE_HEALTH_DEAD; the device
+ *                            is condemned and recovery is refused.
+ *
+ * The permanent test is reachable only because, after a transient trip,
+ * the health module keeps counting bits within the same batch instead
+ * of bailing out — so a genuinely stuck noise source escalates from
+ * transient to permanent inside a single transfer.
+ *
+ * H = 0.88 bits/bit (design target for the Infinite Noise multiplier).
  */
-#define INM_MAX_SEQUENCE	40
-#define INM_MAX_COUNT		(1 << 14)	/* Max counter value before scaling */
 
 /*
- * Fixed-point arithmetic for health check (avoid floating point in kernel)
- * Using 16.16 fixed point format
+ * Repetition Count Test (4.4.1)
+ *
+ *   C = 1 + ⌈-log2(α) / H⌉
+ *
+ * Transient: 1 + ⌈30 / 0.88⌉ = 1 + 35 = 36
+ * Permanent: 1 + ⌈60 / 0.88⌉ = 1 + 69 = 70
  */
-#define FP_SHIFT		16
-#define FP_ONE			(1 << FP_SHIFT)	/* 1.0 in fixed point */
-#define FP_HALF			(FP_ONE >> 1)	/* 0.5 in fixed point */
+#define INM_RCT_TRANS_CUTOFF	36
+#define INM_RCT_PERM_CUTOFF	70
 
-/* Design constants in fixed-point (K = 1.84) */
-#define INM_DESIGN_K_FP		120586	/* 1.84 * 65536 */
-/* log2(1.84) ≈ 0.88 in fixed-point */
-#define INM_EXPECTED_ENTROPY_FP	57671	/* 0.88 * 65536 */
-/* INM_ACCURACY = 1.03 in fixed-point */
-#define INM_ACCURACY_FP		67502	/* 1.03 * 65536 */
+/*
+ * Adaptive Proportion Test (4.4.2) — binary form, W = 1024.
+ *
+ * Critical value derived from BinomCDF^-1 with p = 2^-H = 2^-0.88 ≈ 0.5436.
+ * Normal approximation with continuity correction:
+ *
+ *   μ = W·p ≈ 556.61
+ *   σ = √(W·p·(1-p)) ≈ 15.94
+ *   C ≈ ⌈μ + z(α)·σ + 0.5⌉
+ *
+ * Transient: z(2^-30) ≈ 6.00  ⇒  C ≈ 653 → 656 (+3 margin)
+ * Permanent: z(2^-60) ≈ 8.78  ⇒  C ≈ 697 → 700 (+3 margin)
+ */
+#define INM_APT_WINDOW		1024
+#define INM_APT_TRANS_CUTOFF	656
+#define INM_APT_PERM_CUTOFF	700
 
-/* Keccak-1600 constants */
-#define KECCAK_STATE_SIZE	200	/* 1600 bits = 200 bytes */
-#define KECCAK_LANES		25	/* 5x5 lanes */
-#define KECCAK_ROUNDS		24	/* Number of rounds */
+/*
+ * Stats fields are kept for UAPI compatibility but are no longer estimated
+ * at runtime; report the design constants in 16.16 fixed-point.
+ */
+#define INM_REPORTED_ENTROPY_FP	57671	/* 0.88 * 65536 */
+#define INM_REPORTED_K_FP	120586	/* 1.84 * 65536 */
+
+/*
+ * SHA3-256 conditioning state.
+ *
+ * Each refill cycle the driver consumes oversample_factor full USB
+ * transfers worth of extracted bytes E (8 source samples per byte) and
+ * computes:
+ *
+ *   O  = SHA3-256(S || 0x11 || E)   ← user-visible output (32 bytes)
+ *   S' = SHA3-256(S || 0x00 || E)   ← next internal state (32 bytes)
+ *
+ * S starts as all zero. Output and next-state derivations both use the
+ * *current* S, so an attacker who learns O cannot derive S' without
+ * inverting the hash, and vice versa (forward security).
+ */
+#define INFNOISE_SHA3_OUTPUT_SIZE	32
+
+/* Domain separators between the two H(S || ds || E) derivations. */
+#define INFNOISE_DS_STATE	0x00	/* derive next state S' */
+#define INFNOISE_DS_OUTPUT	0x11	/* derive output O */
+
+/*
+ * Bit-extraction recap. The hardware delivers INFNOISE_BUFLEN = 512 raw
+ * USB bytes per transfer. infnoise_extract_bytes() reads exactly one
+ * comparator bit per raw byte (alternating COMP1/COMP2 by phase) — so
+ * per transfer we collect 512 independent source samples. Those bits
+ * are then packed eight-to-a-byte into INFNOISE_BYTES_OUT = 64 output
+ * bytes (extracted, *not* raw). Every extracted byte therefore carries
+ * 8 source samples × H bits of min-entropy.
+ *
+ *   1 transfer  → 512 source samples → 64 extracted bytes
+ *   At H = 0.88: 64 extracted bytes ≈ 450 bits of min-entropy
+ *
+ * NIST full-entropy condition (SP 800-90B §3.1.5.1.2 / SP 800-90C):
+ * for an n-bit conditioned output to be claimed as full entropy, the
+ * conditioning input must carry at least n + 64 bits of min-entropy.
+ * For SHA3-256 (n = 256) that is 320 bits.
+ *
+ * Required extracted-input bytes B satisfy:
+ *
+ *   B · 8 · H ≥ NIST_FULL_ENTROPY_BITS
+ *   B ≥ ⌈ NIST_FULL_ENTROPY_BITS · H_DEN / (8 · H_NUM) ⌉ = ⌈45.45⌉ = 46
+ *
+ * H is expressed as the integer ratio 88/100 to keep the math
+ * floating-point free.
+ */
+#define INFNOISE_NIST_FULL_ENTROPY_BITS	320	/* 256 + 64 */
+#define INFNOISE_DESIGN_H_NUM		88	/* 0.88 bits/bit */
+#define INFNOISE_DESIGN_H_DEN		100
+#define INFNOISE_NIST_MIN_INPUT_BYTES \
+	(((INFNOISE_NIST_FULL_ENTROPY_BITS * INFNOISE_DESIGN_H_DEN) + \
+	  (8 * INFNOISE_DESIGN_H_NUM) - 1) / \
+	 (8 * INFNOISE_DESIGN_H_NUM))		/* = 46 */
+
+/*
+ * Oversampling: how many full USB transfers worth of *extracted* bytes
+ * (INFNOISE_BYTES_OUT = 64 per transfer ≈ 450 bits of design entropy)
+ * are absorbed per 32-byte SHA3 output.
+ *
+ *   - oversample = 1 already absorbs 64 ≥ 46 bytes (≈ 450 bits ≥ 320),
+ *     satisfying the NIST 256 + 64 input-entropy requirement.
+ *   - Default 2 doubles the absorbed entropy for additional margin
+ *     against any deviation from the H = 0.88 design assumption.
+ *   - Cap at 16 bounds the kernel-side input buffer at 1 KiB.
+ *
+ * The driver enforces oversample · INFNOISE_BYTES_OUT ≥
+ * INFNOISE_NIST_MIN_INPUT_BYTES at compile time via BUILD_BUG_ON in
+ * infnoise_main.c.
+ */
+#define INFNOISE_OVERSAMPLE_MIN		1
+#define INFNOISE_OVERSAMPLE_MAX		16
+#define INFNOISE_OVERSAMPLE_DEFAULT	2
 
 /*
  * hwrng quality settings (bits of entropy per 1024 bits of input)
  * - Raw mode: 0.88 bits/bit (unwhitened, reflects true entropy rate)
- * - Whitened mode: ~1.0 bits/bit (Keccak output is cryptographically uniform)
+ * - Whitened mode: SHA3-256 output is full entropy when ≥ 256 input
+ *   bits of entropy are absorbed (always true with oversample ≥ 1).
  */
 #define INFNOISE_QUALITY_RAW		880	/* Raw: 0.88 bits/bit */
-#define INFNOISE_QUALITY_WHITENED	990	/* Whitened: ~1.0 bits/bit, slight margin */
+#define INFNOISE_QUALITY_WHITENED	1000	/* Whitened: ~1.0 bits/bit */
 
 /* Timeouts */
 #define INFNOISE_USB_TIMEOUT	1000	/* USB timeout in ms */
@@ -137,6 +233,7 @@
 /* Module parameters */
 extern bool infnoise_debug;
 extern bool infnoise_raw_mode;
+extern unsigned int infnoise_oversample;
 
 /* IOCTL definitions */
 #define INFNOISE_IOC_MAGIC	'N'
@@ -151,53 +248,51 @@ extern bool infnoise_raw_mode;
  * userspace process can issue INFNOISE_GET_STATS on a 64-bit kernel.
  * Explicit padding ensures sizeof() == 40 on both, and __aligned(8)
  * forces u64 alignment on 32-bit where u64 is normally 4-byte aligned.
+ *
+ * even_misfires/odd_misfires are retained for ABI stability and report
+ * 0 — the prediction-based estimator that tracked them has been replaced
+ * by the NIST SP 800-90B RCT/APT pair, which has no equivalent counters.
  */
 struct infnoise_stats {
 	__u64 total_bits;
 	__u32 total_ones;
 	__u32 total_zeros;
-	__u32 even_misfires;
-	__u32 odd_misfires;
-	__u32 entropy_estimate;	/* Fixed-point 16.16 */
-	__u32 k_estimate;	/* Fixed-point 16.16 */
+	__u32 even_misfires;	/* Always 0; kept for ABI compatibility */
+	__u32 odd_misfires;	/* Always 0; kept for ABI compatibility */
+	__u32 entropy_estimate;	/* Fixed-point 16.16: design constant */
+	__u32 k_estimate;	/* Fixed-point 16.16: design constant */
 	__u8 warmup_complete;
 	__u8 health_ok;
 	__u8 __pad[6];
 } __aligned(8);
 
-/* Health check state */
+/* Health check state (NIST SP 800-90B RCT + APT, two-tier thresholds) */
 struct infnoise_health {
-	u32 *ones_even;		/* Prediction table for even bits = 1 */
-	u32 *zeros_even;	/* Prediction table for even bits = 0 */
-	u32 *ones_odd;		/* Prediction table for odd bits = 1 */
-	u32 *zeros_odd;		/* Prediction table for odd bits = 0 */
+	/* Repetition Count Test */
+	u32 rct_count;		/* current run length */
+	bool rct_a;		/* sample value being repeated */
 
-	u32 prev_bits;		/* Previous N bits for prediction */
-	u32 num_bits_sampled;	/* Total bits in current entropy window */
-	u32 num_bits_of_entropy;/* Estimated entropy bits */
-	u32 entropy_level;	/* Accumulated entropy */
+	/* Adaptive Proportion Test */
+	u32 apt_count;		/* count of samples == apt_a in window */
+	u32 apt_pos;		/* position 0..INM_APT_WINDOW-1 */
+	bool apt_a;		/* current window's reference sample */
 
-	u64 total_bits;		/* Total bits processed */
-	u32 total_ones;		/* Count of 1 bits */
-	u32 total_zeros;	/* Count of 0 bits */
+	/* Statistics */
+	u64 total_bits;
+	u32 total_ones;
+	u32 total_zeros;
+	u32 transient_failures;	/* total RCT/APT transient trips observed */
 
-	u32 even_misfires;	/* Even bit prediction failures */
-	u32 odd_misfires;	/* Odd bit prediction failures */
-
-	u32 seq_zeros;		/* Consecutive zeros */
-	u32 seq_ones;		/* Consecutive ones */
-
-	u32 current_prob;	/* Current probability (fixed-point) */
-
-	bool prev_bit;		/* Previous bit value */
-	bool prev_even;		/* Previous even bit */
-	bool prev_odd;		/* Previous odd bit */
-	bool ok_to_use;		/* Health check passed */
+	/* Status */
+	bool warmup_complete;	/* first APT window completed cleanly */
+	bool failed;		/* transient trip — cleared on reset */
+	bool dead;		/* permanent trip — sticky across resets */
 };
 
-/* Keccak state */
-struct infnoise_keccak {
-	u8 state[KECCAK_STATE_SIZE];
+/* SHA3-256 conditioning state (kernel crypto API) */
+struct infnoise_sha3 {
+	struct crypto_shash *tfm;
+	u8 state[INFNOISE_SHA3_OUTPUT_SIZE];	/* internal state S */
 };
 
 /* Device state flags */
@@ -205,7 +300,8 @@ enum infnoise_flags {
 	INFNOISE_PRESENT	= BIT(0),	/* Device is connected */
 	INFNOISE_WARMUP_DONE	= BIT(1),	/* Warmup complete */
 	INFNOISE_HWRNG_REG	= BIT(2),	/* hwrng registered */
-	INFNOISE_HEALTH_FAIL	= BIT(3),	/* Health check failed */
+	INFNOISE_HEALTH_FAIL	= BIT(3),	/* Transient health failure */
+	INFNOISE_HEALTH_DEAD	= BIT(4),	/* Permanent health failure */
 };
 
 /* Main device structure */
@@ -223,12 +319,15 @@ struct infnoise_device {
 	u8 *clock_buf;		/* Clock pattern buffer (512 bytes) */
 	u8 *usb_buf;		/* Raw USB read buffer (576 bytes w/ FTDI status) */
 	u8 *read_buf;		/* Processed read buffer (512 bytes, status stripped) */
-	u8 *out_buf;		/* Output buffer (64 bytes) */
+	u8 *out_buf;		/* Single-transfer extracted buffer (64 bytes) */
+	u8 *input_buf;		/* Concatenated extracted bytes across transfers,
+				 * fed as input E to SHA3 conditioning */
 
 	/* State */
 	struct infnoise_health health;
-	struct infnoise_keccak keccak;
-	u32 keccak_bytes_left;		/* Bytes remaining from current absorption */
+	struct infnoise_sha3 sha3;
+	u8 sha3_out[INFNOISE_SHA3_OUTPUT_SIZE];	/* latest output O */
+	unsigned int out_pos;			/* bytes consumed from sha3_out */
 
 	/* hwrng interface */
 	struct hwrng hwrng;
@@ -254,27 +353,18 @@ struct infnoise_device {
 	u32 recoveries;			/* Successful recovery count */
 };
 
-/* Keccak functions (infnoise_keccak.c) */
-void infnoise_keccak_init(struct infnoise_keccak *keccak);
-void infnoise_keccak_absorb(struct infnoise_keccak *keccak, const u8 *data,
-			    unsigned int lanes);
-void infnoise_keccak_extract(struct infnoise_keccak *keccak, u8 *data,
-			     size_t bytes);
-void infnoise_keccak_permutation(struct infnoise_keccak *keccak);
+/* SHA3 conditioning (infnoise_sha3.c) */
+int  infnoise_sha3_init(struct infnoise_sha3 *sha3);
+void infnoise_sha3_free(struct infnoise_sha3 *sha3);
+int  infnoise_sha3_update(struct infnoise_sha3 *sha3,
+			  const u8 *entropy, size_t entropy_len,
+			  u8 *output);
 
 /* Health check functions (infnoise_health.c) */
-int infnoise_health_init(struct infnoise_health *health);
-void infnoise_health_free(struct infnoise_health *health);
+void infnoise_health_init(struct infnoise_health *health);
 void infnoise_health_reset(struct infnoise_health *health);
-bool infnoise_health_add_bit(struct infnoise_health *health, bool even_bit,
-			     bool odd_bit, bool even);
+bool infnoise_health_add_bit(struct infnoise_health *health, bool bit);
 bool infnoise_health_ok(struct infnoise_health *health);
-u32 infnoise_health_get_entropy(struct infnoise_health *health);
-void infnoise_health_clear_entropy(struct infnoise_health *health);
-bool infnoise_health_entropy_on_target(struct infnoise_health *health,
-				       u32 entropy, u32 num_bits);
-u32 infnoise_health_estimate_k(struct infnoise_health *health);
-u32 infnoise_health_estimate_entropy_per_bit(struct infnoise_health *health);
 void infnoise_health_get_stats(struct infnoise_health *health,
 			       struct infnoise_stats *stats);
 

@@ -1,15 +1,15 @@
 # Infinite Noise TRNG Kernel Module
 
-A Linux kernel module for the Infinite Noise TRNG USB device. This driver directly interfaces with the FT240X-based hardware, implements health monitoring, Keccak-1600 whitening, and registers as an hwrng device to feed entropy to the kernel's random subsystem.
+A Linux kernel module for the Infinite Noise TRNG USB device. This driver directly interfaces with the FT240X-based hardware, runs the NIST SP 800-90B Repetition Count and Adaptive Proportion tests on the raw bit stream, conditions it through SHA3-256 (kernel crypto API), and registers as an hwrng device to feed entropy to the kernel's random subsystem.
 
 ## Features
 
 - Hardware random number generator (hwrng) interface at `/dev/hwrng`
 - Automatic entropy feeding to kernel CRNG (no rngd required on Linux 3.16+)
 - Character device interface at `/dev/infnoiseX`
-- Real-time health monitoring with entropy validation
-- Keccak-1600 sponge for cryptographic whitening
-- Configurable output multiplier for higher throughput
+- NIST SP 800-90B continuous health tests (RCT + APT)
+- SHA3-256 conditioning with internal state and forward-secret derivation
+- Configurable oversampling factor (raw transfers absorbed per output)
 - Hot-plug support
 - No conflicts with ftdi_sio driver
 
@@ -151,7 +151,7 @@ sudo depmod -a
 echo "infnoise" | sudo tee /etc/modules-load.d/infnoise.conf
 
 # Optional: set default parameters
-echo "options infnoise multiplier=2" | sudo tee /etc/modprobe.d/infnoise.conf
+echo "options infnoise oversample=4" | sudo tee /etc/modprobe.d/infnoise.conf
 ```
 
 ### Unloading
@@ -168,12 +168,12 @@ sudo rmmod infnoise
 |-----------|------|---------|-------------|
 | `debug` | bool | false | Enable verbose debug output |
 | `raw_mode` | bool | false | Output raw (unwhitened) data |
-| `multiplier` | uint | 1 | Keccak output multiplier (0-10) |
+| `oversample` | uint | 2 | Raw transfers absorbed per 32-byte SHA3 output (1-16) |
 
 ### Setting Parameters at Load Time
 
 ```bash
-sudo insmod infnoise.ko debug=1 multiplier=4
+sudo insmod infnoise.ko debug=1 oversample=4
 ```
 
 ### Changing Parameters at Runtime
@@ -182,26 +182,40 @@ sudo insmod infnoise.ko debug=1 multiplier=4
 # Enable debug output
 echo 1 | sudo tee /sys/module/infnoise/parameters/debug
 
-# Set multiplier to 4x
-echo 4 | sudo tee /sys/module/infnoise/parameters/multiplier
+# Set oversampling factor
+echo 4 | sudo tee /sys/module/infnoise/parameters/oversample
 
 # Check current values
-cat /sys/module/infnoise/parameters/multiplier
+cat /sys/module/infnoise/parameters/oversample
 ```
 
-### Multiplier Values
+### Oversampling Factor
 
-The `multiplier` parameter controls how much data is squeezed from the Keccak sponge per entropy absorption:
+The `oversample` parameter sets how many full USB transfers of *extracted* entropy are absorbed per 32-byte SHA3-256 output.
 
-| Value | Output per Round | Approximate Speed |
-|-------|------------------|-------------------|
-| 0 | Entropy bits only | ~50 Kbit/s |
-| 1 | 32 bytes | ~124 Kbit/s |
-| 2 | 64 bytes | ~249 Kbit/s |
-| 4 | 128 bytes | ~499 Kbit/s |
-| 10 | 320 bytes | ~1.2 Mbit/s |
+Each USB transfer pulls 512 raw bytes from the FT240X. The extractor reads exactly **one** comparator bit per raw byte — COMP1 on odd-phase samples, COMP2 on even-phase — so each transfer yields 512 independent source bits, packed eight-to-a-byte into 64 *extracted* bytes. At the design min-entropy H = 0.88 bits/bit, that's:
 
-Higher multiplier values produce more cryptographically secure pseudo-random data per true random sample. The output remains cryptographically secure due to the Keccak sponge construction.
+```
+512 source bits × 0.88 = 450.56 bits of min-entropy per 64 extracted bytes
+```
+
+NIST SP 800-90B §3.1.5.1.2 (and SP 800-90C) require the conditioning input to carry at least **n + 64 bits of min-entropy** for an n-bit output to be claimed as full entropy. For SHA3-256 (n = 256) that is **320 bits**, i.e. ⌈320 / (8·0.88)⌉ = 46 extracted bytes minimum. Even `oversample=1` (64 extracted bytes) clears that floor with margin; higher values are pure paranoia headroom and the build statically asserts the lower bound.
+
+| Value | Extracted absorbed | Min-entropy in | Output per refill |
+|-------|--------------------|---------------|-------------------|
+| 1     | 64 B               | ~450 bits     | 32 B              |
+| 2 (default) | 128 B        | ~900 bits     | 32 B              |
+| 4     | 256 B              | ~1800 bits    | 32 B              |
+| 16    | 1024 B             | ~7200 bits    | 32 B              |
+
+Per refill, the driver computes both the user output and the next internal state from the same input under distinct domain-separator bytes:
+
+```
+O  = SHA3-256(S || 0x11 || E)   ← returned to caller
+S' = SHA3-256(S || 0x00 || E)   ← replaces internal state
+```
+
+Knowledge of `O` does not allow recovery of `S'` (or vice versa) without inverting SHA3-256.
 
 ## Usage
 
@@ -246,7 +260,7 @@ sudo dd if=/dev/hwrng bs=2500 count=100 | rngtest -c 100
 Since Linux kernel 3.16+, the hwrng subsystem automatically feeds entropy to the kernel's random pool via an internal kernel thread (`hwrng_fillfn`). **No rngd daemon is required.**
 
 The driver dynamically sets the quality parameter based on the output mode:
-- **Whitened mode (default)**: quality=990 (Keccak output is cryptographically uniform)
+- **Whitened mode (default)**: quality=1000 (SHA3-256 output is full-entropy when ≥256 bits of entropy are absorbed, which always holds with `oversample` ≥ 1)
 - **Raw mode**: quality=880 (reflects the ~0.88 bits/bit true entropy rate)
 
 The hwrng core thread continuously:
@@ -364,17 +378,23 @@ The VID 0x1209 is provided by [pid.codes](https://pid.codes/), a registry for US
 
 ## Technical Details
 
-### Health Monitoring
+### Health Monitoring (NIST SP 800-90B 4.4)
 
-- Tracks 14 previous bits to predict next bit
-- Uses fixed-point arithmetic (16.16 format)
-- Requires ~80,000 bits warmup before data is valid
-- Detects stuck-at faults (>20 consecutive identical bits)
+Each test carries two thresholds, computed from per-sample design entropy H = 0.88 bits/bit:
+
+| Test | Transient (α = 2⁻³⁰) | Permanent (α = 2⁻⁶⁰) |
+|------|----------------------|----------------------|
+| **RCT** — consecutive identical samples | 36 | 70 |
+| **APT** — matches in 1024-sample window | 656 | 700 |
+
+- **Transient** trips latch `INFNOISE_HEALTH_FAIL`. The current batch is dropped and the existing recovery path (`infnoise_try_recovery`) re-arms RCT/APT and continues.
+- **Permanent** trips latch `INFNOISE_HEALTH_DEAD`. The device is condemned: recovery refuses to run, all read paths return `-EIO`, and the only way back is to unbind the driver and replug.
+- The two thresholds share counters: a stuck source that crosses the transient line keeps counting bits within the same batch, so it escalates from transient (low evidence) to permanent (overwhelming evidence) inside a single transfer rather than churning recoveries forever.
+- Warmup completes after the first clean APT window (~1024 raw bits, two USB transfers).
 
 ## License
 
 - Driver code: GPL-2.0-or-later
-- Keccak implementation: CC0-1.0 (public domain)
 
 ## See Also
 

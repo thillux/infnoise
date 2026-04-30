@@ -11,6 +11,9 @@
 config HW_RANDOM_INFNOISE
 	tristate "Infinite Noise TRNG support"
 	depends on USB && HW_RANDOM
+	select CRYPTO
+	select CRYPTO_HASH
+	select CRYPTO_SHA3
 	help
 	  This driver provides support for the Infinite Noise True Random
 	  Number Generator (TRNG) USB device.
@@ -21,8 +24,8 @@ config HW_RANDOM_INFNOISE
 	  thermal noise.
 
 	  The driver implements:
-	    - Health monitoring with prediction-based entropy validation
-	    - Keccak-1600 sponge-based whitening
+	    - NIST SP 800-90B health tests (RCT and APT) on the raw stream
+	    - SHA3-256 conditioning (kernel crypto API) with internal state
 	    - hwrng interface for kernel entropy pool contribution
 	    - Character device (/dev/infnoiseX) for direct access
 

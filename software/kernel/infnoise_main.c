@@ -8,8 +8,9 @@
  * Hardware design by Bill Cox
  *
  * This driver interfaces with the Infinite Noise TRNG USB device,
- * implements health monitoring, Keccak-1600 whitening, and registers
- * as an hwrng device to feed entropy to the kernel's random subsystem.
+ * runs NIST SP 800-90B health tests on the raw bit stream, conditions
+ * it through SHA3-256 (kernel crypto API), and registers as an hwrng
+ * device that feeds entropy to the kernel's random subsystem.
  */
 
 #include <linux/kernel.h>
@@ -38,9 +39,10 @@ bool infnoise_raw_mode;
 module_param_named(raw_mode, infnoise_raw_mode, bool, 0644);
 MODULE_PARM_DESC(raw_mode, "Output raw (unwhitened) data");
 
-unsigned int infnoise_multiplier = 1;
-module_param_named(multiplier, infnoise_multiplier, uint, 0644);
-MODULE_PARM_DESC(multiplier, "Output multiplier (0=entropy only, 1-10=multiply output)");
+unsigned int infnoise_oversample = INFNOISE_OVERSAMPLE_DEFAULT;
+module_param_named(oversample, infnoise_oversample, uint, 0644);
+MODULE_PARM_DESC(oversample,
+		 "Raw USB transfers absorbed per 32-byte SHA3 output (1-16, default 2)");
 
 /* USB device table - only matches reprogrammed devices */
 static const struct usb_device_id infnoise_table[] = {
@@ -204,6 +206,16 @@ static int infnoise_try_recovery(struct infnoise_device *dev)
 	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
 		return -ENODEV;
 
+	/*
+	 * A permanent health failure (α = 2^-60 trip on RCT or APT) is
+	 * by design unrecoverable. infnoise_health_reset() is a no-op once
+	 * health->dead is latched, so a recovery here would silently leave
+	 * the device condemned anyway — return -EIO immediately and avoid
+	 * the FTDI churn.
+	 */
+	if (test_bit(INFNOISE_HEALTH_DEAD, &dev->flags))
+		return -EIO;
+
 	dev_warn(&dev->intf->dev, "Attempting error recovery...\n");
 
 	/* Clear any halt conditions on endpoints */
@@ -275,16 +287,25 @@ static void infnoise_prepare_clock_buffer(struct infnoise_device *dev)
  * Extract entropy bits from raw USB data
  *
  * In synchronous bit-bang mode, each byte read back contains the state
- * of all pins. We extract one bit per byte from COMP1/COMP2 alternating.
+ * of all pins. We extract one bit per byte from COMP1/COMP2 alternating
+ * and feed it through the NIST SP 800-90B health tests.
+ *
+ * The per-bit feed is *not* short-circuited on a transient health trip:
+ * we want the RCT/APT counters to keep climbing within this batch so a
+ * genuinely stuck source can escalate from transient (α = 2^-30) to
+ * permanent (α = 2^-60) before the caller hands control to recovery.
+ * A permanent trip aborts the batch immediately.
+ *
+ * Returns the number of bits extracted on success, or a negative errno
+ * when a health test trips (-EIO for transient or permanent).
  */
 static int infnoise_extract_bytes(struct infnoise_device *dev, u8 *bytes,
 				  size_t length, const u8 *in_buf)
 {
 	unsigned int i, j;
+	bool dead = false;
 
-	infnoise_health_clear_entropy(&dev->health);
-
-	for (i = 0; i < length; i++) {
+	for (i = 0; i < length && !dead; i++) {
 		u8 byte = 0;
 
 		for (j = 0; j < 8; j++) {
@@ -292,23 +313,35 @@ static int infnoise_extract_bytes(struct infnoise_device *dev, u8 *bytes,
 			bool even_bit = (val >> INFNOISE_COMP2) & 1;
 			bool odd_bit = (val >> INFNOISE_COMP1) & 1;
 			bool even = j & 1; /* Use even bit if j is odd */
-			u8 bit = even ? even_bit : odd_bit;
+			bool bit = even ? even_bit : odd_bit;
 
 			byte = (byte << 1) | bit;
 
-			/* Feed bit to health checker */
-			if (!infnoise_health_add_bit(&dev->health, even_bit,
-						     odd_bit, even)) {
-				dev_err(&dev->intf->dev,
-					"Health check failed!\n");
-				set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
-				return -EIO;
+			if (!infnoise_health_add_bit(&dev->health, bit)) {
+				dead = true;
+				break;
 			}
 		}
 		bytes[i] = byte;
 	}
 
-	return infnoise_health_get_entropy(&dev->health);
+	if (dev->health.dead) {
+		dev_crit(&dev->intf->dev,
+			 "Health check permanent failure — device condemned\n");
+		set_bit(INFNOISE_HEALTH_DEAD, &dev->flags);
+		set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
+		return -EIO;
+	}
+
+	if (dev->health.failed) {
+		dev_warn(&dev->intf->dev,
+			 "Health check transient failure (total: %u)\n",
+			 dev->health.transient_failures);
+		set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
+		return -EIO;
+	}
+
+	return (int)(length * 8);
 }
 
 /*
@@ -515,109 +548,135 @@ static int infnoise_usb_transfer(struct infnoise_device *dev)
 }
 
 /*
- * Squeeze whitened data from Keccak sponge
+ * Run one transfer, gating on the NIST RCT/APT health tests.
  *
- * Extracts up to 128 bytes per call. If more data is needed,
- * performs a permutation and can be called again.
- * Returns number of bytes extracted.
+ * Returns the number of source bits delivered into dev->out_buf on success
+ * (always INFNOISE_BUFLEN), 0 if the data must be discarded (warmup not
+ * complete yet — caller treats this as "try again later"), or a negative
+ * errno on USB / health failures.
  */
-static int infnoise_keccak_squeeze(struct infnoise_device *dev, u8 *result,
-				   size_t max_len)
+static int infnoise_get_one_transfer(struct infnoise_device *dev)
 {
-	size_t out_bytes;
+	int ret = infnoise_usb_transfer(dev);
 
-	/* Extract at most 128 bytes (16 lanes) for security margin */
-	out_bytes = min_t(size_t, max_len, 128);
-	infnoise_keccak_extract(&dev->keccak, result, out_bytes);
+	if (ret < 0)
+		return ret;
 
-	/* Permute state for next extraction */
-	infnoise_keccak_permutation(&dev->keccak);
+	if (!infnoise_health_ok(&dev->health)) {
+		if (infnoise_debug)
+			dev_dbg(&dev->intf->dev, "Health check not OK yet\n");
+		return 0;
+	}
 
-	return out_bytes;
+	return ret;
+}
+
+/*
+ * Refill the SHA3 output buffer.
+ *
+ * Reads infnoise_oversample full USB transfers, extracts INFNOISE_BYTES_OUT
+ * bytes from each (each byte packs 8 source samples — one comparator bit
+ * per raw RNG byte, alternating COMP1/COMP2 by phase), concatenates them
+ * into dev->input_buf, and derives a fresh output O and next state S'
+ * from the same input via:
+ *
+ *   O  = SHA3-256(S || 0x11 || E)
+ *   S' = SHA3-256(S || 0x00 || E)
+ *
+ * On success out_pos is reset to 0 and 32 fresh bytes sit in sha3_out.
+ * Returns 0 on success, a positive value when the caller should retry
+ * (warmup pending), or a negative errno on hard failure.
+ */
+static int infnoise_sha3_refill(struct infnoise_device *dev)
+{
+	unsigned int factor;
+	unsigned int i;
+	int ret;
+
+	/*
+	 * Static guard for the NIST SP 800-90B full-entropy requirement:
+	 * the smallest permissible oversample setting must absorb at least
+	 * 320 design-entropy bits per 256-bit SHA3 output (= n + 64).
+	 *
+	 * Each transfer contributes INFNOISE_BYTES_OUT extracted bytes,
+	 * each holding 8 independent source samples (one comparator bit —
+	 * COMP1 on odd phases, COMP2 on even phases — per raw RNG byte).
+	 */
+	BUILD_BUG_ON(INFNOISE_OVERSAMPLE_MIN * INFNOISE_BYTES_OUT <
+		     INFNOISE_NIST_MIN_INPUT_BYTES);
+
+	factor = READ_ONCE(infnoise_oversample);
+	factor = clamp(factor, (unsigned int)INFNOISE_OVERSAMPLE_MIN,
+		       (unsigned int)INFNOISE_OVERSAMPLE_MAX);
+
+	for (i = 0; i < factor; i++) {
+		ret = infnoise_get_one_transfer(dev);
+		if (ret < 0)
+			return ret;
+		if (ret == 0)
+			return 1; /* warmup not done — caller retries */
+
+		memcpy(dev->input_buf + i * INFNOISE_BYTES_OUT,
+		       dev->out_buf, INFNOISE_BYTES_OUT);
+	}
+
+	ret = infnoise_sha3_update(&dev->sha3, dev->input_buf,
+				   (size_t)factor * INFNOISE_BYTES_OUT,
+				   dev->sha3_out);
+	if (ret) {
+		dev_err(&dev->intf->dev, "SHA3 update failed: %d\n", ret);
+		return ret;
+	}
+
+	dev->out_pos = 0;
+	return 0;
 }
 
 /*
  * Read random data from the device
  *
  * This is the main data path used by both hwrng and character device.
- * Supports multiplier for increased output rate from Keccak sponge.
+ * In raw mode, returns up to 64 bytes of unwhitened entropy from a
+ * single USB transfer; in default (whitened) mode, returns up to 32
+ * bytes of SHA3-256 output, refilling on demand.
  */
 static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
 			      size_t max_len, bool raw)
 {
-	int entropy;
 	size_t out_bytes;
-	unsigned int mult;
+	int ret;
 
-	/* Check device is still present */
 	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
 		return -ENODEV;
 
-	/*
-	 * If we have bytes left from a previous absorption (multiplier > 1),
-	 * squeeze more data without doing a new USB transfer.
-	 */
-	if (dev->keccak_bytes_left > 0 && !raw) {
-		out_bytes = min_t(size_t, max_len, dev->keccak_bytes_left);
-		out_bytes = infnoise_keccak_squeeze(dev, result, out_bytes);
-		dev->keccak_bytes_left -= out_bytes;
-		dev->bytes_generated += out_bytes;
-		return out_bytes;
-	}
+	if (test_bit(INFNOISE_HEALTH_DEAD, &dev->flags))
+		return -EIO;
 
-	/* Perform USB transfer to get new entropy */
-	entropy = infnoise_usb_transfer(dev);
-	if (entropy < 0)
-		return entropy;
-
-	/* Check health status */
-	if (!infnoise_health_ok(&dev->health)) {
-		if (infnoise_debug)
-			dev_dbg(&dev->intf->dev, "Health check not OK yet\n");
-		return 0; /* Discard data but don't error */
-	}
-
-	/* Check entropy meets target */
-	if (!infnoise_health_entropy_on_target(&dev->health, entropy,
-					       INFNOISE_BUFLEN)) {
-		if (infnoise_debug)
-			dev_dbg(&dev->intf->dev, "Entropy below target\n");
-		return 0; /* Discard data */
-	}
-
-	/* Return raw data if requested */
 	if (raw) {
+		ret = infnoise_get_one_transfer(dev);
+		if (ret <= 0)
+			return ret;
+
 		out_bytes = min_t(size_t, max_len, INFNOISE_BYTES_OUT);
 		memcpy(result, dev->out_buf, out_bytes);
 		dev->bytes_generated += out_bytes;
 		return out_bytes;
 	}
 
-	/* Absorb raw data into Keccak sponge (64 bytes = 8 lanes) */
-	infnoise_keccak_absorb(&dev->keccak, dev->out_buf, INFNOISE_BYTES_OUT / 8);
-
-	/* Calculate total bytes to output based on multiplier */
-	mult = infnoise_multiplier;
-	if (mult > 10)
-		mult = 10;  /* Cap at 10x for sanity */
-
-	if (mult == 0) {
-		/* Output only entropy bits worth of data */
-		out_bytes = entropy / 8;
-	} else {
-		/* Output multiplier * 32 bytes (256 bits per multiplier unit) */
-		out_bytes = mult * 32;
+	/* Whitened: drain whatever's left from the previous output first. */
+	if (dev->out_pos >= INFNOISE_SHA3_OUTPUT_SIZE) {
+		ret = infnoise_sha3_refill(dev);
+		if (ret < 0)
+			return ret;
+		if (ret > 0)
+			return 0;	/* warmup pending — retry */
 	}
 
-	/* Set up remaining bytes for subsequent reads */
-	dev->keccak_bytes_left = out_bytes;
-
-	/* Squeeze first chunk */
-	out_bytes = min_t(size_t, max_len, dev->keccak_bytes_left);
-	out_bytes = infnoise_keccak_squeeze(dev, result, out_bytes);
-	dev->keccak_bytes_left -= out_bytes;
+	out_bytes = min_t(size_t, max_len,
+			  INFNOISE_SHA3_OUTPUT_SIZE - dev->out_pos);
+	memcpy(result, dev->sha3_out + dev->out_pos, out_bytes);
+	dev->out_pos += out_bytes;
 	dev->bytes_generated += out_bytes;
-
 	return out_bytes;
 }
 
@@ -637,7 +696,8 @@ static void infnoise_warmup_work(struct work_struct *work)
 
 	while (!infnoise_health_ok(&dev->health) &&
 	       rounds < INFNOISE_WARMUP_ROUNDS &&
-	       test_bit(INFNOISE_PRESENT, &dev->flags)) {
+	       test_bit(INFNOISE_PRESENT, &dev->flags) &&
+	       !test_bit(INFNOISE_HEALTH_DEAD, &dev->flags)) {
 		infnoise_read_data(dev, discard, sizeof(discard), true);
 		rounds++;
 	}
@@ -649,7 +709,10 @@ static void infnoise_warmup_work(struct work_struct *work)
 		return;
 	}
 
-	if (rounds >= INFNOISE_WARMUP_ROUNDS) {
+	if (test_bit(INFNOISE_HEALTH_DEAD, &dev->flags)) {
+		dev_crit(&dev->intf->dev,
+			 "Warmup aborted: device condemned by health tests\n");
+	} else if (rounds >= INFNOISE_WARMUP_ROUNDS) {
 		dev_err(&dev->intf->dev,
 			"Warmup failed after %u rounds\n", rounds);
 		set_bit(INFNOISE_HEALTH_FAIL, &dev->flags);
@@ -665,14 +728,14 @@ static void infnoise_warmup_work(struct work_struct *work)
 /* ============== hwrng interface ============== */
 
 /*
- * Drive recovery if HEALTH_FAIL is latched.
+ * Drive recovery if HEALTH_FAIL is latched, refuse it if HEALTH_DEAD is.
  *
- * HEALTH_FAIL is set by the extract path on a stuck-at-N detection, which
- * can be a false positive on a long but legitimate run of identical bits.
- * The flag would otherwise dead-end the read paths forever, because they
- * gate on it before ever reaching the transfer/recovery machinery. Calling
- * infnoise_try_recovery here resets health state and lets the device
- * self-heal. Returns 0 if the device is usable, negative errno otherwise.
+ * HEALTH_FAIL alone is a transient health failure (α = 2^-30): clear
+ * test state and let the next batch try again. HEALTH_DEAD is a
+ * permanent failure (α = 2^-60): the device is condemned and cannot
+ * be recovered from software — return -EIO unconditionally.
+ *
+ * Returns 0 if the device is usable, negative errno otherwise.
  */
 static int infnoise_recover_if_health_failed(struct infnoise_device *dev)
 {
@@ -681,12 +744,17 @@ static int infnoise_recover_if_health_failed(struct infnoise_device *dev)
 	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
 		return -ENODEV;
 
+	if (test_bit(INFNOISE_HEALTH_DEAD, &dev->flags))
+		return -EIO;
+
 	if (!test_bit(INFNOISE_HEALTH_FAIL, &dev->flags))
 		return 0;
 
 	mutex_lock(&dev->lock);
 	/* Re-check under lock; another caller may have just recovered. */
-	if (test_bit(INFNOISE_HEALTH_FAIL, &dev->flags))
+	if (test_bit(INFNOISE_HEALTH_DEAD, &dev->flags))
+		ret = -EIO;
+	else if (test_bit(INFNOISE_HEALTH_FAIL, &dev->flags))
 		ret = infnoise_try_recovery(dev);
 	mutex_unlock(&dev->lock);
 
@@ -916,13 +984,24 @@ static long infnoise_ioctl(struct file *file, unsigned int cmd,
 		WRITE_ONCE(dev->raw_mode, !!raw);
 		return 0;
 
-	case INFNOISE_GET_ENTROPY:
+	case INFNOISE_GET_ENTROPY: {
+		/*
+		 * No more running entropy estimator. Report the raw bit
+		 * count scaled by the design entropy rate (H = 0.88) — a
+		 * cumulative "bits of entropy delivered" figure that grows
+		 * monotonically while the device is running. Saturate at
+		 * U32_MAX rather than wrap.
+		 */
+		u64 bits;
+
 		mutex_lock(&dev->lock);
-		entropy = infnoise_health_get_entropy(&dev->health);
+		bits = (dev->health.total_bits * 88) / 100;
 		mutex_unlock(&dev->lock);
+		entropy = (bits > U32_MAX) ? U32_MAX : (u32)bits;
 		if (copy_to_user((void __user *)arg, &entropy, sizeof(entropy)))
 			return -EFAULT;
 		return 0;
+	}
 
 	default:
 		return -ENOTTY;
@@ -966,11 +1045,12 @@ static void infnoise_delete(struct kref *kref)
 						   struct infnoise_device,
 						   kref);
 
-	infnoise_health_free(&dev->health);
+	infnoise_sha3_free(&dev->sha3);
 	kfree(dev->clock_buf);
 	kfree(dev->usb_buf);
 	kfree(dev->read_buf);
 	kfree(dev->out_buf);
+	kfree(dev->input_buf);
 	usb_put_dev(dev->udev);
 	kfree(dev);
 }
@@ -1028,19 +1108,35 @@ static int infnoise_probe(struct usb_interface *intf,
 	dev->usb_buf = kmalloc(INFNOISE_USB_READ_SIZE, GFP_KERNEL);
 	dev->read_buf = kmalloc(INFNOISE_BUFLEN, GFP_KERNEL);
 	dev->out_buf = kmalloc(INFNOISE_BYTES_OUT, GFP_KERNEL);
+	/*
+	 * input_buf holds up to INFNOISE_OVERSAMPLE_MAX transfers worth of
+	 * extracted bytes concatenated for the SHA3 update. Sized once at
+	 * the upper bound so runtime tweaks of the oversample parameter
+	 * never overflow.
+	 */
+	dev->input_buf = kmalloc(INFNOISE_OVERSAMPLE_MAX * INFNOISE_BYTES_OUT,
+				 GFP_KERNEL);
 
-	if (!dev->clock_buf || !dev->usb_buf || !dev->read_buf || !dev->out_buf) {
+	if (!dev->clock_buf || !dev->usb_buf || !dev->read_buf ||
+	    !dev->out_buf || !dev->input_buf) {
 		ret = -ENOMEM;
 		goto err_put;
 	}
 
-	/* Initialize health check */
-	ret = infnoise_health_init(&dev->health);
-	if (ret)
-		goto err_put;
+	/* Initialize health check (NIST RCT/APT) */
+	infnoise_health_init(&dev->health);
 
-	/* Initialize Keccak */
-	infnoise_keccak_init(&dev->keccak);
+	/* Initialize SHA3-256 (kernel crypto API) */
+	ret = infnoise_sha3_init(&dev->sha3);
+	if (ret) {
+		dev_err(&intf->dev,
+			"SHA3-256 unavailable: %d (CONFIG_CRYPTO_SHA3?)\n",
+			ret);
+		goto err_put;
+	}
+
+	/* No SHA3 output buffered yet — first read triggers a refill. */
+	dev->out_pos = INFNOISE_SHA3_OUTPUT_SIZE;
 
 	/* Prepare clock buffer */
 	infnoise_prepare_clock_buffer(dev);

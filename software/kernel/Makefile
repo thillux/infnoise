@@ -14,7 +14,7 @@ PWD := $(shell pwd)
 
 # Module object files
 obj-m := $(MODULE_NAME).o
-$(MODULE_NAME)-y := infnoise_main.o infnoise_health.o infnoise_keccak.o
+$(MODULE_NAME)-y := infnoise_main.o infnoise_health.o infnoise_sha3.o
 
 # Extra compiler flags
 ccflags-y := -DDEBUG
@@ -44,7 +44,7 @@ uninstall:
 # DKMS version (must match dkms.conf PACKAGE_VERSION)
 DKMS_VERSION := 1.0
 DKMS_SRC := /usr/src/$(MODULE_NAME)-$(DKMS_VERSION)
-DKMS_SRCS := infnoise_main.c infnoise_health.c infnoise_keccak.c infnoise.h Makefile dkms.conf
+DKMS_SRCS := infnoise_main.c infnoise_health.c infnoise_sha3.c infnoise.h Makefile dkms.conf
 
 # Install module source for DKMS
 dkms-install:
