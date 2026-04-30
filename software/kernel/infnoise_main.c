@@ -456,6 +456,14 @@ static int infnoise_usb_transfer(struct infnoise_device *dev)
 	int retry;
 
 	for (retry = 0; retry < INFNOISE_MAX_RETRIES; retry++) {
+		/*
+		 * Bail immediately if disconnect ran between retries: don't
+		 * burn another 1 s usb_bulk_msg timeout, and don't keep
+		 * hwrng_unregister() waiting on an in-flight ->read().
+		 */
+		if (!test_bit(INFNOISE_PRESENT, &dev->flags))
+			return -ENODEV;
+
 		ret = infnoise_usb_transfer_once(dev);
 
 		if (ret >= 0) {
@@ -667,6 +675,9 @@ static int infnoise_recover_if_health_failed(struct infnoise_device *dev)
 {
 	int ret = 0;
 
+	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
+		return -ENODEV;
+
 	if (!test_bit(INFNOISE_HEALTH_FAIL, &dev->flags))
 		return 0;
 
@@ -701,6 +712,15 @@ static int infnoise_hwrng_read(struct hwrng *rng, void *data, size_t max,
 		if (ret)
 			return ret;
 	}
+
+	/*
+	 * Re-check PRESENT after the wait: disconnect uses complete_all()
+	 * to wake us, so a successful wait does NOT imply the device is
+	 * still alive. Returning -ENODEV here lets hwrng core release any
+	 * waiters on /dev/hwrng instead of looping on a 0-return.
+	 */
+	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
+		return -ENODEV;
 
 	if (!test_bit(INFNOISE_WARMUP_DONE, &dev->flags))
 		return 0;
@@ -806,6 +826,9 @@ static ssize_t infnoise_char_read(struct file *file, char __user *buf,
 	if (!dev)
 		return -ENODEV;
 
+	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
+		return -ENODEV;
+
 	/* Wait for warmup */
 	if (!test_bit(INFNOISE_WARMUP_DONE, &dev->flags)) {
 		if (file->f_flags & O_NONBLOCK)
@@ -815,6 +838,13 @@ static ssize_t infnoise_char_read(struct file *file, char __user *buf,
 		if (ret)
 			return ret;
 	}
+
+	/*
+	 * disconnect() does complete_all(&warmup_done) to wake any waiter,
+	 * so a successful wait does not mean the device is still here.
+	 */
+	if (!test_bit(INFNOISE_PRESENT, &dev->flags))
+		return -ENODEV;
 
 	ret = infnoise_recover_if_health_failed(dev);
 	if (ret < 0)
