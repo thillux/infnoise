@@ -15,7 +15,12 @@
 #include <linux/types.h>
 #include <linux/string.h>
 #include <asm/byteorder.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 12, 0)
 #include <asm/unaligned.h>
+#else
+#include <linux/unaligned.h>
+#endif
 #include "infnoise.h"
 
 /* Pre-computed round constants for Keccak-1600 */
