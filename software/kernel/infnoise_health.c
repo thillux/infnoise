@@ -413,13 +413,20 @@ void infnoise_health_clear_entropy(struct infnoise_health *health)
 bool infnoise_health_entropy_on_target(struct infnoise_health *health,
 				       u32 entropy, u32 num_bits)
 {
-	u32 expected;
+	/*
+	 * Test: entropy >= num_bits * EXPECTED_ENTROPY / ACCURACY
+	 * Rewritten without division as:
+	 *     entropy * ACCURACY >= num_bits * EXPECTED_ENTROPY
+	 *
+	 * Compute both sides as u64 (in 16.16 fixed-point units) so the
+	 * comparison is overflow-safe regardless of caller-supplied
+	 * num_bits / entropy. The previous u32 form overflowed once
+	 * num_bits crossed 65535 or entropy crossed ~63662.
+	 */
+	u64 lhs = (u64)entropy * INM_ACCURACY_FP;
+	u64 rhs = (u64)num_bits * INM_EXPECTED_ENTROPY_FP;
 
-	/* expected = num_bits * expected_entropy_per_bit */
-	expected = fp_mul(num_bits << FP_SHIFT, INM_EXPECTED_ENTROPY_FP) >> FP_SHIFT;
-
-	/* Allow INM_ACCURACY tolerance */
-	return (entropy * INM_ACCURACY_FP) >= (expected << FP_SHIFT);
+	return lhs >= rhs;
 }
 
 /**
