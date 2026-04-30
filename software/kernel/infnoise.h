@@ -88,7 +88,13 @@
 #define INM_TABLE_SIZE		(1 << INM_PREDICTION_BITS)	/* 16384 entries */
 #define INM_MIN_DATA		80000	/* Minimum bits before data is valid */
 #define INM_MIN_SAMPLE_SIZE	100	/* Minimum samples */
-#define INM_MAX_SEQUENCE	20	/* Max consecutive same bits */
+/*
+ * Max consecutive same-valued bits before declaring a stuck-at fault.
+ * Sized per NIST SP 800-90B repetition-count test: C >= 1 + ceil(-log2(α)/H),
+ * with α = 2^-30 (false-positive rate) and H = 0.88 bits/bit ⇒ C ≈ 36.
+ * 40 leaves margin for the empirical entropy varying slightly below target.
+ */
+#define INM_MAX_SEQUENCE	40
 #define INM_MAX_COUNT		(1 << 14)	/* Max counter value before scaling */
 
 /*
