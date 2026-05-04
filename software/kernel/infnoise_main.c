@@ -142,6 +142,41 @@ static int infnoise_configure_ftdi(struct infnoise_device *dev)
 }
 
 /*
+ * Put the FTDI chip back into a quiet default state.
+ *
+ * The chip latches synchronous bit-bang mode across USB bus resets, so
+ * if we leave it enabled the device keeps streaming data on the bulk-IN
+ * endpoint after we're gone. On the next boot the host controller's
+ * port reset can't bring the device back to addr 0 cleanly — observed
+ * as "Device not responding to setup address" / "device not accepting
+ * address N, error -71" until enough probe-time resets eventually win.
+ *
+ * Issuing BITMODE_RESET (mode 0x00) returns the chip to UART mode where
+ * it stays silent until commanded; the trailing SIO_RESET clears any
+ * latched FTDI controller state.
+ *
+ * Best-effort: if the device is already gone (unplug), control transfers
+ * fail with -ENODEV / -ESHUTDOWN; that's expected, not an error.
+ */
+static void infnoise_quiesce_ftdi(struct infnoise_device *dev)
+{
+	int ret;
+
+	ret = ftdi_control(dev, FTDI_SIO_SET_BITMODE,
+			   (FTDI_BITMODE_RESET << 8) | 0x00,
+			   FTDI_INDEX_INTERFACE_A);
+	if (ret < 0 && ret != -ENODEV && ret != -ESHUTDOWN)
+		dev_dbg(&dev->intf->dev,
+			"Could not exit bit-bang mode on teardown: %d\n", ret);
+
+	ret = ftdi_control(dev, FTDI_SIO_RESET, FTDI_SIO_RESET_SIO,
+			   FTDI_INDEX_INTERFACE_A);
+	if (ret < 0 && ret != -ENODEV && ret != -ESHUTDOWN)
+		dev_dbg(&dev->intf->dev,
+			"Could not reset FTDI on teardown: %d\n", ret);
+}
+
+/*
  * Test USB transfer to verify device is working
  * Similar to what libftdi does during initialization
  */
@@ -1160,16 +1195,54 @@ static void infnoise_disconnect(struct usb_interface *intf)
 	 */
 	usb_deregister_dev(intf, &infnoise_class);
 
+	/*
+	 * Now that all in-flight readers are drained and no new ones can
+	 * start, leave the FTDI chip in a quiet state so a subsequent
+	 * rmmod+modprobe (or replug) doesn't trip on a still-streaming
+	 * bit-bang endpoint. On a real unplug the control transfers fail
+	 * harmlessly with -ENODEV.
+	 */
+	infnoise_quiesce_ftdi(dev);
+
 	usb_set_intfdata(intf, NULL);
 
 	/* Drop the probe-time reference. */
 	kref_put(&dev->kref, infnoise_delete);
 }
 
+/*
+ * shutdown() — invoked by the driver core during system reboot/poweroff.
+ * disconnect() is NOT called on shutdown, so without this hook the FTDI
+ * keeps streaming bit-bang data on its bulk-IN endpoint right up until
+ * power is cut. On the next boot, the host controller's port reset can
+ * race against that data flood and fail to assign an address ("device
+ * not accepting address N, error -71"), recovering only after several
+ * retries from probe / the recovery path.
+ */
+static void infnoise_shutdown(struct usb_interface *intf)
+{
+	struct infnoise_device *dev = usb_get_intfdata(intf);
+
+	if (!dev)
+		return;
+
+	/*
+	 * Stop further driver-initiated I/O so we don't race with the
+	 * quiesce control transfers below. PRESENT gates both read paths
+	 * and the recovery machinery.
+	 */
+	clear_bit(INFNOISE_PRESENT, &dev->flags);
+	complete_all(&dev->warmup_done);
+	cancel_work_sync(&dev->warmup_work);
+
+	infnoise_quiesce_ftdi(dev);
+}
+
 static struct usb_driver infnoise_driver = {
 	.name		= DRIVER_NAME,
 	.probe		= infnoise_probe,
 	.disconnect	= infnoise_disconnect,
+	.shutdown	= infnoise_shutdown,
 	.id_table	= infnoise_table,
 	.supports_autosuspend = 0,  /* No suspend - device feeds entropy continuously */
 };
