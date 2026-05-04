@@ -417,13 +417,24 @@ static int infnoise_usb_transfer_once(struct infnoise_device *dev)
 	/*
 	 * Read samples - FTDI returns data in 64-byte packets with 2 status
 	 * bytes per packet. We need to read until we have enough data bytes.
+	 *
+	 * The URB length passed to usb_bulk_msg() must be a multiple of the
+	 * bulk-IN wMaxPacketSize: if a full max-size packet arrives that
+	 * would push the running byte count past the requested length, xHCI
+	 * raises a babble error (-EOVERFLOW). The first request below is
+	 * already aligned (INFNOISE_USB_READ_SIZE == 9*FTDI_PACKET_SIZE),
+	 * but partial completions on a short packet leave total_read
+	 * non-aligned, so each subsequent request is rounded up to mps.
+	 * usb_buf is allocated with one mps of slack so the rounded-up
+	 * request always fits.
 	 */
 	while (total_read < INFNOISE_USB_READ_SIZE) {
 		int remaining = INFNOISE_USB_READ_SIZE - total_read;
+		int request = ALIGN(remaining, dev->bulk_in_mps);
 
 		ret = usb_bulk_msg(dev->udev,
 				   usb_rcvbulkpipe(dev->udev, dev->bulk_in_ep),
-				   dev->usb_buf + total_read, remaining,
+				   dev->usb_buf + total_read, request,
 				   &actual, INFNOISE_USB_TIMEOUT);
 		if (ret < 0) {
 			if (infnoise_debug)
@@ -1053,14 +1064,24 @@ static int infnoise_probe(struct usb_interface *intf,
 	dev->intf = intf;
 	dev->bulk_in_ep = bulk_in->bEndpointAddress;
 	dev->bulk_out_ep = bulk_out->bEndpointAddress;
+	dev->bulk_in_mps = usb_endpoint_maxp(bulk_in);
+	if (!dev->bulk_in_mps)
+		dev->bulk_in_mps = FTDI_PACKET_SIZE;
 
 	mutex_init(&dev->lock);
 	init_completion(&dev->warmup_done);
 	INIT_WORK(&dev->warmup_work, infnoise_warmup_work);
 
-	/* Allocate buffers */
+	/*
+	 * Allocate buffers. usb_buf carries one extra max-packet of slack so
+	 * the read loop can always request a length rounded up to the bulk-IN
+	 * wMaxPacketSize without risking xHCI babble (-EOVERFLOW) when the
+	 * device delivers a full-packet right after a non-aligned partial
+	 * read.
+	 */
 	dev->clock_buf = kmalloc(INFNOISE_BUFLEN, GFP_KERNEL);
-	dev->usb_buf = kmalloc(INFNOISE_USB_READ_SIZE, GFP_KERNEL);
+	dev->usb_buf = kmalloc(INFNOISE_USB_READ_SIZE + dev->bulk_in_mps,
+			       GFP_KERNEL);
 	dev->read_buf = kmalloc(INFNOISE_BUFLEN, GFP_KERNEL);
 	dev->out_buf = kmalloc(INFNOISE_BYTES_OUT, GFP_KERNEL);
 

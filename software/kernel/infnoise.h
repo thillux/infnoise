@@ -218,6 +218,7 @@ struct infnoise_device {
 	/* USB endpoints */
 	u8 bulk_in_ep;
 	u8 bulk_out_ep;
+	unsigned int bulk_in_mps;	/* bulk-IN wMaxPacketSize */
 
 	/* Buffers */
 	u8 *clock_buf;		/* Clock pattern buffer (512 bytes) */
