@@ -53,7 +53,7 @@ MODULE_DEVICE_TABLE(usb, infnoise_table);
 static struct usb_driver infnoise_driver;
 static void infnoise_warmup_work(struct work_struct *work);
 static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
-			      size_t max_len, bool raw, bool allow_usb_reset);
+			      size_t max_len, bool raw);
 static int infnoise_configure_ftdi(struct infnoise_device *dev);
 static void infnoise_delete(struct kref *kref);
 
@@ -228,17 +228,17 @@ static int infnoise_test_transfer(struct infnoise_device *dev)
  *
  * This function tries to restore communication with the device after
  * consecutive USB errors. It clears endpoint halts and reconfigures
- * the FTDI chip. If that fails and the caller permits it, it attempts
- * a full USB device reset.
+ * the FTDI chip. If that fails it falls back to a full USB device
+ * reset followed by another reconfigure attempt.
  *
- * @allow_usb_reset: if true, fall back to usb_reset_device() when FTDI
- *   reconfiguration fails. Must be false when called from a context that
- *   holds a lock disconnect() will wait on (see comment below).
+ * Safe to call with dev->lock held: pre_reset/post_reset are defined,
+ * so usb_reset_device() does not unbind this interface and therefore
+ * does not invoke infnoise_disconnect() (which would self-deadlock
+ * waiting on cancel_work_sync()/hwrng_unregister()).
  *
  * Returns 0 on successful recovery, negative error code on failure.
  */
-static int infnoise_try_recovery(struct infnoise_device *dev,
-				 bool allow_usb_reset)
+static int infnoise_try_recovery(struct infnoise_device *dev)
 {
 	int ret;
 
@@ -254,29 +254,8 @@ static int infnoise_try_recovery(struct infnoise_device *dev,
 	/* Small delay to let things settle */
 	msleep(INFNOISE_RETRY_DELAY_MS);
 
-	/*
-	 * Try to reconfigure the FTDI device first; if that succeeds we
-	 * avoid the heavier usb_reset_device() fallback below.
-	 *
-	 * usb_reset_device() forces an unbind of this interface, which runs
-	 * infnoise_disconnect() synchronously in the same task. disconnect()
-	 * calls hwrng_unregister(), which waits for the in-flight ->read()
-	 * to return — that in-flight read *is this task* when recovery is
-	 * invoked from infnoise_hwrng_read() / infnoise_char_read() (the
-	 * hwrng core holds its reading_mutex across ->read()). Self-deadlock,
-	 * observed as usb_hub_wq blocked on device_del waiting on the
-	 * reader. Callers from those paths must therefore pass
-	 * allow_usb_reset=false.
-	 */
 	ret = infnoise_configure_ftdi(dev);
 	if (ret < 0) {
-		if (!allow_usb_reset) {
-			dev_err(&dev->intf->dev,
-				"FTDI reconfiguration failed (%d); replug to recover\n",
-				ret);
-			return ret;
-		}
-
 		dev_warn(&dev->intf->dev,
 			 "FTDI reconfiguration failed (%d); attempting USB reset\n",
 			 ret);
@@ -509,8 +488,7 @@ static bool infnoise_is_recoverable_error(int err)
  * errors exceed INFNOISE_RECOVERY_THRESHOLD, attempts device recovery.
  * Returns number of entropy bits, or negative error.
  */
-static int infnoise_usb_transfer(struct infnoise_device *dev,
-				 bool allow_usb_reset)
+static int infnoise_usb_transfer(struct infnoise_device *dev)
 {
 	int ret;
 	int retry;
@@ -546,8 +524,7 @@ static int infnoise_usb_transfer(struct infnoise_device *dev,
 
 		/* Attempt recovery if we've hit the threshold */
 		if (dev->consecutive_errors >= INFNOISE_RECOVERY_THRESHOLD) {
-			int recovery_ret = infnoise_try_recovery(dev,
-								 allow_usb_reset);
+			int recovery_ret = infnoise_try_recovery(dev);
 
 			if (recovery_ret < 0) {
 				dev_err(&dev->intf->dev,
@@ -601,7 +578,7 @@ static int infnoise_keccak_squeeze(struct infnoise_device *dev, u8 *result,
  * Supports multiplier for increased output rate from Keccak sponge.
  */
 static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
-			      size_t max_len, bool raw, bool allow_usb_reset)
+			      size_t max_len, bool raw)
 {
 	int entropy;
 	size_t out_bytes;
@@ -624,7 +601,7 @@ static int infnoise_read_data(struct infnoise_device *dev, u8 *result,
 	}
 
 	/* Perform USB transfer to get new entropy */
-	entropy = infnoise_usb_transfer(dev, allow_usb_reset);
+	entropy = infnoise_usb_transfer(dev);
 	if (entropy < 0)
 		return entropy;
 
@@ -696,12 +673,7 @@ static void infnoise_warmup_work(struct work_struct *work)
 	while (!infnoise_health_ok(&dev->health) &&
 	       rounds < INFNOISE_WARMUP_ROUNDS &&
 	       test_bit(INFNOISE_PRESENT, &dev->flags)) {
-		/*
-		 * Warmup runs in workqueue context, not under the hwrng
-		 * reading_mutex, so a usb_reset_device() fallback in
-		 * recovery is safe here.
-		 */
-		infnoise_read_data(dev, discard, sizeof(discard), true, true);
+		infnoise_read_data(dev, discard, sizeof(discard), true);
 		rounds++;
 	}
 
@@ -749,14 +721,8 @@ static int infnoise_recover_if_health_failed(struct infnoise_device *dev)
 
 	mutex_lock(&dev->lock);
 	/* Re-check under lock; another caller may have just recovered. */
-	if (test_bit(INFNOISE_HEALTH_FAIL, &dev->flags)) {
-		/*
-		 * Both callers (hwrng_read, char_read) reach this with
-		 * locks held that disconnect() will wait on, so the
-		 * usb_reset_device() fallback in recovery must stay off.
-		 */
-		ret = infnoise_try_recovery(dev, false);
-	}
+	if (test_bit(INFNOISE_HEALTH_FAIL, &dev->flags))
+		ret = infnoise_try_recovery(dev);
 	mutex_unlock(&dev->lock);
 
 	return ret;
@@ -802,7 +768,7 @@ static int infnoise_hwrng_read(struct hwrng *rng, void *data, size_t max,
 		return ret;
 
 	mutex_lock(&dev->lock);
-	ret = infnoise_read_data(dev, data, max, raw, false);
+	ret = infnoise_read_data(dev, data, max, raw);
 	mutex_unlock(&dev->lock);
 
 	return ret;
@@ -928,8 +894,7 @@ static ssize_t infnoise_char_read(struct file *file, char __user *buf,
 		mutex_lock(&dev->lock);
 		ret = infnoise_read_data(dev, data, chunk,
 					 READ_ONCE(infnoise_raw_mode) ||
-					 READ_ONCE(dev->raw_mode),
-					 false);
+					 READ_ONCE(dev->raw_mode));
 		mutex_unlock(&dev->lock);
 
 		if (ret < 0)
@@ -1238,11 +1203,40 @@ static void infnoise_shutdown(struct usb_interface *intf)
 	infnoise_quiesce_ftdi(dev);
 }
 
+/*
+ * pre_reset() / post_reset() — declared so usb_reset_device() does NOT
+ * unbind this interface across a bus reset.
+ *
+ * Without these callbacks the USB core forces an unbind+rebind, which
+ * runs infnoise_disconnect() synchronously in the resetting task. That
+ * task is typically the warmup workqueue worker or a thread holding
+ * dev->lock from the recovery path, both of which disconnect() then
+ * tries to wait on (cancel_work_sync(&warmup_work),
+ * hwrng_unregister(), and the implicit dev->lock dependency) →
+ * self-deadlock.
+ *
+ * No quiescing work is needed here: this driver issues only synchronous
+ * usb_bulk_msg / usb_control_msg transfers, all serialized by dev->lock,
+ * which the only reset call site (infnoise_try_recovery) already holds.
+ * Returning 0 tells the USB core to keep us bound across the reset.
+ */
+static int infnoise_pre_reset(struct usb_interface *intf)
+{
+	return 0;
+}
+
+static int infnoise_post_reset(struct usb_interface *intf)
+{
+	return 0;
+}
+
 static struct usb_driver infnoise_driver = {
 	.name		= DRIVER_NAME,
 	.probe		= infnoise_probe,
 	.disconnect	= infnoise_disconnect,
 	.shutdown	= infnoise_shutdown,
+	.pre_reset	= infnoise_pre_reset,
+	.post_reset	= infnoise_post_reset,
 	.id_table	= infnoise_table,
 	.supports_autosuspend = 0,  /* No suspend - device feeds entropy continuously */
 };
